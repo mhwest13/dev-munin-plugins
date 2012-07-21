@@ -1,0 +1,497 @@
+#!/usr/bin/perl
+#
+#
+# The objective of this plugin is to monitor Cassandra, while allowing for ease of configuration in regards
+# to different ColumnFamilyStores and Keyspaces, first initial version will deal with 1 keyspace and one columnfamilystore
+
+use strict;
+use warnings;
+
+my $url = $ENV{url} || 'service:jmx:rmi:///jndi/rmi://localhost:8080/jmxrmi';
+my $jar = $ENV{jar} || '/usr/share/munin/plugins/mw-jmxquery.jar';
+my @kscf = $ENV{kscf} || ('MW_News:News');
+my $java = $ENV{java} || '/usr/bin/java';
+
+# %graphs   is a container for all of the graph definition information. In here is where you'll
+#           find the configuration information for munin's graphing procedure.
+#   Format:
+#
+#   $graph{graph_name} => {
+#       config => {
+#           # You'll find keys and values stored here for graph manipulation
+#       },
+#       datasrc => [
+#           # Name: name given to data value
+#           # Attr: Attribute for given value
+#           { name => 'Name', (Attr) },
+#           { ... },
+#       ],
+#   }
+my %graphs;
+
+$graphs{opsactive} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'Operations Active',
+        category => 'Cassandra',
+        title => 'Operations Active',
+        info => 'This graph shows the number of Operations Actively Running',
+    },
+    datasrc => [
+        { name => 'flushes', label => 'Active Flushes', min => '0', object => 'org.apache.cassandra.concurrent:type=FLUSH-WRITER-POOL', attr => 'ActiveCount' },
+        { name => 'hinthandoff', label => 'Active Hinted Handoffs', min => '0', object => 'org.apache.cassandra.concurrent:type=HINTED-HANDOFF-POOL', attr => 'ActiveCount' },
+        { name => 'reads', label => 'Active Reads', min => '0', object => 'org.apache.cassandra.concurrent:type=ROW-READ-STAGE', attr => 'ActiveCount' },
+        { name => 'writes', label => 'Active Writes', min => '0', object => 'org.apache.cassandra.concurrent:type=ROW-MUTATION-STAGE', attr => 'ActiveCount' },
+        { name => 'commits', label => 'Active Commits', min => '0', object => 'org.apache.cassandra.db:type=Commitlog', attr => 'ActiveCount' },
+    ],
+};
+
+$graphs{opspending} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'Operations Pending',
+        category => 'Cassandra',
+        title => 'Operations Pending',
+        info => 'This graph shows the number of Operations Pending Completion',
+    },
+    datasrc => [
+        { name => 'flushes', label => 'Pending Flushes', min => '0', object => 'org.apache.cassandra.concurrent:type=FLUSH-WRITER-POOL', attr => 'PendingTasks' },
+        { name => 'hinthandoff', label => 'Pending Hinted Handoffs', min => '0', object => 'org.apache.cassandra.concurrent:type=HINTED-HANDOFF-POOL', attr => 'PendingTasks' },
+        { name => 'reads', label => 'Pending Reads', min => '0', object => 'org.apache.cassandra.concurrent:type=ROW-READ-STAGE', attr => 'PendingTasks' },
+        { name => 'writes', label => 'Pending Writes', min => '0', object => 'org.apache.cassandra.concurrent:type=ROW-MUTATION-STAGE', attr => 'PendingTasks' },
+        { name => 'compacts', label => 'Pending Compactions', min => '0', object => 'org.apache.cassandra.db:type=CompactionManager', attr => 'PendingTasks' },
+        { name => 'commits', label => 'Pending Commits', min => '0', object => 'org.apache.cassandra.db:type=Commitlog', attr => 'PendingTasks' },
+    ],
+};
+
+$graphs{splatency} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'Milliseconds',
+        category => 'Cassandra',
+        title => 'StorageProxy Latency',
+        info => 'StorageProxy Read/Write Latency',
+        order => 'read_lat write_lat',
+    },
+    datasrc => [
+        { name => 'read_lat', label => 'Read Latency', min => '0', object => 'org.apache.cassandra.service:type=StorageProxy', attr => 'TotalReadLatencyMicros', type => 'DERIVE', cdef => 'read_lat,3000000,/' },
+        { name => 'write_lat', label => 'Write Latency', min => '0', object => 'org.apache.cassandra.service:type=StorageProxy', attr => 'TotalWriteLatencyMicros', type => 'DERIVE', cdef => 'write_lat,3000000,/' },
+    ],
+};
+
+$graphs{spops} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'Operations per ${graph_period}',
+        category => 'Cassandra',
+        title => 'StorageProxy Operations',
+        info => 'StorageProxy Operations',
+        order => 'read_ops write_ops',
+    },
+    datasrc => [
+        { name => 'read_ops', label => 'Read Operations', min => '0', object => 'org.apache.cassandra.service:type=StorageProxy', attr => 'ReadOperations', type => 'DERIVE' },
+        { name => 'write_ops', label => 'Write Operations', min => '0', object => 'org.apache.cassandra.service:type=StorageProxy', attr => 'WriteOperations', type => 'DERIVE' },
+    ],
+};
+
+$graphs{compactbytes} = {
+    config => {
+        args => '--upper-limit 100 --lower-limit 0',
+        vlabel => '%',
+        category => 'Cassandra',
+        title => 'Compacted Bytes Percentage',
+        info => 'Percentage of Compaction Process Completed',
+    },
+    datasrc => [
+        { name => 'bytescompact', min => '0', object => 'org.apache.cassandra.db:type=CompactionManager', attr => 'BytesCompacted' },
+        { name => 'bytestotal', min => '0', object => 'org.apache.cassandra.db:type=CompactionManager', attr => 'BytesTotalInProgress' },
+        { name => 'bytespercnt', label => 'Compaction Completion', min => '0', draw => 'AREA' },
+    ],
+};
+
+$graphs{kslatency} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'Milliseconds',
+        category => 'Cassandra',
+        title => 'Overall Latency: ',
+        info => 'Overall Read/Write Latency',
+        order => 'read_lat write_lat',
+    },
+    datasrc => [
+        { name => 'read_lat', label => 'Read Latency', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'TotalReadLatencyMicros', type => 'DERIVE', cdef => 'read_lat,3000000,/' },
+        { name => 'write_lat', label => 'Write Latency', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'TotalWriteLatencyMicros', type => 'DERIVE', cdef => 'write_lat,3000000,/' },
+    ],
+};
+
+$graphs{ksrlatency} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'Milliseconds',
+        category => 'Cassandra',
+        title => 'Recent Latency: ',
+        info => 'Recent Read/Write Latency',
+        order => 'read_lat write_lat',
+    },
+    datasrc => [
+        { name => 'read_lat', label => 'Recent Read Latency', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'RecentReadLatencyMicros' },
+        { name => 'write_lat', label => 'Recent Write Latency', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'RecentWriteLatencyMicros' },
+    ],
+};
+
+$graphs{kskcachesize} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => '# of Keys',
+        category => 'Cassandra',
+        title => 'KeyCache Size: ',
+        info => 'KeyCache Size (used / total)',
+        order => 'cache_size cache_used cache_ratio',
+    },
+    datasrc => [
+        { name => 'cache_size', label => 'Total Cache Size', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Capacity', draw => 'AREA' },
+        { name => 'cache_used', label => 'Current Cache in Use', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Size', draw => 'AREA' },
+        { name => 'cache_ratio', label => 'Recent Cache Hit Ratio', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'RecentHitRate', draw => 'LINE' },
+    ],
+};
+
+$graphs{kskcachehits} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'KeyCache Hit Ratio',
+        category => 'Cassandra',
+        title => 'KeyCache Hits: ',
+        info => 'KeyCache Hits Ratio for the keyspace',
+        order => 'cache_reqs cache_hits',
+    },
+    datasrc => [
+        { name => 'cache_reqs', label => 'Total Cache Requests', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Requests', type => 'DERIVE' },
+        { name => 'cache_hits', label => 'Total Cache Hits', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Hits', type => 'DERIVE' },
+    ],
+};
+
+$graphs{ksrcachesize} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => '# of Rows',
+        category => 'Cassandra',
+        title => 'RowCache Size: ',
+        info => 'RowCache Size (used / total) for the keyspace',
+        order => 'cache_size cache_used cache_ratio',
+    },
+    datasrc => [
+        { name => 'cache_size', label => 'Total Cache Size', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Capacity', draw => 'AREA' },
+        { name => 'cache_used', label => 'Current Cache in Use', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Size', draw => 'AREA' },
+        { name => 'cache_ratio', label => 'Recent Cache Hit Ratio', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'RecentHitRate', draw => 'LINE' },
+    ],
+};
+
+$graphs{ksrcachehits} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        vlabel => 'Cache Row Hit Ratio',
+        category => 'Cassandra',
+        title => 'RowCache Hits: ',
+        info => 'RowCache Hits Ratio for the keyspace',
+        order => 'cache_reqs cache_hits',
+    },
+    datasrc => [
+        { name => 'cache_reqs', label => 'Total Cache Requests', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Requests', type => 'DERIVE' },
+        { name => 'cache_hits', label => 'Total Cache Hits', min => '0', object => 'org.apache.cassandra.db:type=Caches,', attr => 'Hits', type => 'DERIVE' },
+    ],
+};
+
+$graphs{kscount} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        category => 'Cassandra',
+        title => 'Processing Operations: ',
+        info => 'Processing Operations for the keyspace',
+    },
+    datasrc => [
+        { name => 'memcolumn', label => 'Memtable Columns', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'MemtableColumnsCount', type => 'DERIVE' },
+        { name => 'memswitch', label => 'Memtable Switches', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'MemtableSwitchCount' },
+        { name => 'reads', label => 'Reads', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'ReadCount', type => 'DERIVE' },
+        { name => 'writes', label => 'Writes', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'WriteCount', type => 'DERIVE' },
+    ],
+};
+
+$graphs{kslivesst} = {
+    config => {
+        args => '--base 1000 --lower-limit 0',
+        category => 'Cassandra',
+        title => 'SSTable Count: ',
+        info => 'SSTable Count',
+    },
+    datasrc => [
+        { name => 'livesst', label => 'Live SSTables', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'LiveSSTableCount' },
+    ],
+};
+
+$graphs{ksdisk} = {
+    config => {
+        args => '--base 1024 --lower-limit 0',
+        vlabel => 'Cassandra Disk Usage',
+        category => 'Cassandra',
+        title => 'Disk Space Used: ',
+        info => 'Disk Space Used on this node by this keyspace',
+    },
+    datasrc => [
+        { name => 'livedisk', label => 'Disk Usage', min => '0', object => 'org.apache.cassandra.db:type=ColumnFamilyStores,', attr => 'LiveDiskSpaceUsed', draw => 'AREA' },
+    ],
+};
+
+$graphs{jvmmemory} = {
+    config => {
+        args => '--base 1024 --lower-limit 0',
+        vlabel => 'JVM Memory Usage (Bytes)',
+        category => 'Cassandra',
+        title => 'Cassandra JVM Info',
+        info => 'JVM Memory Usage for Cassandra JVM',
+        order => 'heap_m heap_c heap_u nonheap_m nonheap_c nonheap_u',
+    },
+    datasrc => [
+        { name => 'nonheap_c', label => 'Non-Heap Committed', min => '0', object => 'java.lang:type=Memory', attr => 'NonHeapMemoryUsage', key => 'committed', draw => 'LINE' },
+        { name => 'nonheap_m', label => 'Non-Heap Max', min => '0', object => 'java.lang:type=Memory', attr => 'NonHeapMemoryUsage', key => 'max', draw => 'LINE' },
+        { name => 'nonheap_u', label => 'Non-Heap Used', min => '0', object => 'java.lang:type=Memory', attr => 'NonHeapMemoryUsage', key => 'used', draw => 'LINE' },
+        { name => 'heap_c', label => 'Heap Committed', min => '0', object => 'java.lang:type=Memory', attr => 'HeapMemoryUsage', key => 'committed', draw => 'AREA' },
+        { name => 'heap_m', label => 'Heap Max', min => '0', object => 'java.lang:type=Memory', attr => 'HeapMemoryUsage', key => 'max', draw => 'AREA' },
+        { name => 'heap_u', label => 'Heap Used', min => '0', object => 'java.lang:type=Memory', attr => 'HeapMemoryUsage', key => 'used', draw => 'LINE' },
+    ],
+};
+
+## Lets see what we can do now that we have some basic graph info
+$0 =~ /cassandra_(.+)*/;
+my $plugin = $1;
+die 'Unknown Plugin Specified: ' . ($plugin ? $plugin : '') unless $graphs{$plugin};
+
+#./check_jmx -U service:jmx:rmi:///jndi/rmi://10.4.11.74:8080/jmxrmi -O org.apache.cassandra.db:type=ColumnFamilyStores,keyspace=MW_News,columnfamily=News -A TotalWriteLatencyMicros -vvvv
+
+if (defined $ARGV[0] && $ARGV[0] eq 'config') {
+
+   # Now lets go ahead and print out our config.
+   do_config($plugin);
+   exit 0;
+}
+
+&print_root_output($plugin);
+
+sub do_config {
+    my ($plugin) = (@_);
+
+    my $graph = $graphs{$plugin};
+    my %graphconf = %{$graph->{config}};
+
+
+    if (($plugin !~ /^ks/) && ($plugin ne "compactbytes")) {
+        #print "graph cassandra_$plugin\n";
+
+        while ( my ($key, $value) = each(%graphconf)) {
+            print "graph_$key $value\n";
+        }
+
+        foreach my $dsrc (@{$graph->{datasrc}}) {
+            my %datasrc = %$dsrc;
+            while ( my ($key, $value) = each(%datasrc)) {
+                next if ($key =~ /name|object|attr|key/);
+                print "$dsrc->{name}.$key $value\n";
+            }
+        }
+    } elsif ($plugin eq "compactbytes") {
+        #print "graph cassandra_$plugin\n";
+
+        while ( my ($key, $value) = each (%graphconf)) {
+            print "graph_$key $value\n";
+        }
+
+        foreach my $dsrc (@{$graph->{datasrc}}) {
+            next if ($dsrc->{name} =~ /bytescompact|bytestotal/);
+            my %datasrc = %$dsrc;
+            while ( my ($key, $value) = each(%datasrc)) {
+                next if ($key =~ /name|object|attr/);
+                print "$dsrc->{name}.$key $value\n";
+            }
+        }
+    } else {
+        my ($cf,$ks) = ();
+        foreach my $tmpkc (@kscf) {
+            ($ks, $cf) = split(/:/, $tmpkc);
+
+            #print "graph cassandra_$plugin\_$ks\n";
+
+            while ( my ($key, $value) = each(%graphconf)) {
+                if ($key eq "title") {
+                    print "graph_$key $value" . "$ks\n";
+                } else {
+                    print "graph_$key $value\n";
+                }
+            }
+
+            foreach my $dsrc (@{$graph->{datasrc}}) {
+                my %datasrc = %$dsrc;
+                while ( my ($key, $value) = each(%datasrc)) {
+                    next if ($key =~ /name|object|attr/);
+                    if ($key eq "title") {
+                        print "$dsrc->{name}.$key $value" . "$ks\n";
+                    } else {
+                        print "$dsrc->{name}.$key $value\n";
+                    }
+                }
+            }
+        }
+    }
+
+    return;
+}
+
+sub print_root_output {
+    my ($plugin) = (@_);
+
+    my $graph = $graphs{$plugin};
+
+    if (($plugin !~ /^ks/) && ($plugin ne "compactbytes") && ($plugin ne "jvmmemory")) {
+        #print "graph cassandra_$plugin\n";
+
+        foreach my $dsrc (@{$graph->{datasrc}}) {
+            my %datasrc = %$dsrc;
+            my $object = $dsrc->{object};
+            my $attribute = $dsrc->{attr};
+            my $output = &fetch($object,$attribute);
+            print "$dsrc->{name}.value $output";
+        }
+    } elsif ($plugin eq "jvmmemory") {
+        foreach my $dsrc (@{$graph->{datasrc}}) {
+            my %datasrc = %$dsrc;
+            my $object = $dsrc->{object};
+            my $attribute = $dsrc->{attr};
+            my $key = $dsrc->{key};
+            my $output = &fetch($object,$attribute,$key);
+            print "$dsrc->{name}.value $output";
+        }
+    } elsif ($plugin eq "compactbytes") {
+        #print "graph cassandra_$plugin\n";
+
+        my ($current,$total,$percent) = ();
+        foreach my $dsrc (@{$graph->{datasrc}}) {
+            next if ($dsrc->{name} eq "bytespercnt");
+            my %datasrc = %$dsrc;
+            my $object = $dsrc->{object};
+            my $attribute = $dsrc->{attr};
+            my $output = &fetch($object,$attribute);
+            chomp($output);
+            if ($output eq "null") {
+                $output = 0;
+            }
+            if ($dsrc->{name} eq "bytescompact") {
+                $current = $output;
+            } elsif ($dsrc->{name} eq "bytestotal") {
+                $total = $output;
+            }
+        }
+        if (($current == 0) && ($total == 0)) {
+            $percent = 100;
+        } else {
+            $percent = ($current / $total) * 100;
+            $percent = sprintf("%02.2f", $percent);
+        }
+        print "bytespercnt.value $percent\n";
+    } else {
+        my ($cf,$ks) = ();
+        foreach my $tmpkc (@kscf) {
+            ($ks, $cf) = split(/:/, $tmpkc);
+
+            #print "graph cassandra_$plugin\_$ks\n";
+
+            if (($plugin eq "kscount") || ($plugin eq "ksdisk") || ($plugin eq "kslivesst")) {
+                foreach my $dsrc (@{$graph->{datasrc}}) {
+                    my %datasrc = %$dsrc;
+                    my $object = $dsrc->{object} . "keyspace=" . $ks . ",columnfamily=" . $cf;
+                    my $attribute = $dsrc->{attr};
+                    my $output = &fetch($object,$attribute);
+                    print "$dsrc->{name}.value $output";
+                }
+            } elsif ($plugin eq "ksrlatency") {
+                foreach my $dsrc (@{$graph->{datasrc}}) {
+                    my %datasrc = %$dsrc;
+                    my $object = $dsrc->{object} . "keyspace=" . $ks . ",columnfamily=" . $cf;
+                    my $attribute = $dsrc->{attr};
+                    my $output = &fetch($object,$attribute);
+                    $output /= 1000;
+                    $output = sprintf("%02.3f", $output);
+                    print "$dsrc->{name}.value $output\n";
+                }
+            } elsif ($plugin eq "kslatency") {
+                foreach my $dsrc (@{$graph->{datasrc}}) {
+                    my %datasrc = %$dsrc;
+                    my $object = $dsrc->{object} . "keyspace=" . $ks . ",columnfamily=" . $cf;
+                    my $attribute = $dsrc->{attr};
+                    my $output = &fetch($object,$attribute);
+                    $output /= 1000;
+                    $output = sprintf("%02d", $output);
+                    print "$dsrc->{name}.value $output\n";
+                }
+            } elsif (($plugin eq "ksrcachesize") || ($plugin eq "kskcachesize")) {
+                my ($cache_total,$cachetype) = ();
+
+                if ($plugin eq "ksrcachesize") {
+                    $cachetype = "RowCache";
+                } else {
+                    $cachetype = "KeyCache";
+                }
+
+                foreach my $dsrc (@{$graph->{datasrc}}) {
+                    my %datasrc = %$dsrc;
+                    my $object = $dsrc->{object} . "keyspace=" . $ks . ",cache=" . $cf . $cachetype;
+                    my $attribute = $dsrc->{attr};
+                    my $output = &fetch($object,$attribute);
+                    if ($dsrc->{name} eq "cache_size") {
+                        $cache_total = $output;
+                        print "$dsrc->{name}.value $output";
+                    } elsif ($dsrc->{name} eq "cache_ratio") {
+                        $output *= $cache_total;
+                        $output = sprintf("%02d", $output);
+                        print "$dsrc->{name}.value $output\n";
+                    } else {
+                        print "$dsrc->{name}.value $output";
+                    }
+                }
+            } elsif (($plugin eq "ksrcachehits") || ($plugin eq "kskcachehits")) {
+                my $cachetype;
+
+                if ($plugin eq "ksrcachesize") {
+                    $cachetype = "RowCache";
+                } else {
+                    $cachetype = "KeyCache";
+                }
+
+                foreach my $dsrc (@{$graph->{datasrc}}) {
+                    my %datasrc = %$dsrc;
+                    my $object = $dsrc->{object} . "keyspace=" . $ks . ",cache=" . $cf . $cachetype;
+                    my $attribute = $dsrc->{attr};
+                    my $output = &fetch($object,$attribute);
+                    print "$dsrc->{name}.value $output";
+                }
+            }
+        }
+    }
+    return;
+}
+
+sub fetch {
+    my ($object,$attribute,$key) = (@_);
+    my $results;
+    my $java_cmd;
+    
+    if (defined($key)) {
+        $java_cmd = $java . " -jar " . $jar . " -U " . $url . " -O " . $object . " -A " . $attribute . " -K " . $key;
+    } else {
+        $java_cmd = $java . " -jar " . $jar . " -U " . $url . " -O " . $object . " -A " . $attribute;
+    }
+    open (JAVA, "$java_cmd |");
+
+    while (my $line = <JAVA>) {
+        $results = $line;
+    }
+    $results =~ s/^\s+//;
+    return $results;
+}
